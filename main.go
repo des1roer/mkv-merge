@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // naturalLess — сравнение строк в «естественном» порядке:
@@ -110,38 +111,64 @@ func main() {
 		return naturalLess(matched[i], matched[j])
 	})
 
-	mergedCount := 0
+	tasks := make(chan struct {
+		baseName  string
+		videoFile string
+		audioFile string
+	}, len(matched))
+
 	for _, baseName := range matched {
-		videoFile := videoFiles[baseName]
-		audioFile := audioFiles[baseName]
-
-		outputFile := filepath.Join(dir, fmt.Sprintf("%s_merged.mkv", baseName))
-		videoPath := filepath.Join(dir, videoFile)
-		audioPath := filepath.Join(dir, audioFile)
-
-		fmt.Printf("Объединение: %s + %s -> %s\n", videoFile, audioFile, filepath.Base(outputFile))
-
-		cmd := exec.Command("ffmpeg",
-			"-i", videoPath,
-			"-i", audioPath,
-			"-c", "copy",
-			"-map", "0:v:0",
-			"-map", "1:a:0",
-			"-y",
-			outputFile,
-		)
-
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		if err := cmd.Run(); err != nil {
-			fmt.Printf("Ошибка при объединении %s: %v\n", baseName, err)
-			continue
-		}
-
-		mergedCount++
-		fmt.Printf("✓ Успешно: %s\n\n", filepath.Base(outputFile))
+		tasks <- struct {
+			baseName  string
+			videoFile string
+			audioFile string
+		}{baseName, videoFiles[baseName], audioFiles[baseName]}
 	}
+	close(tasks)
+
+	var (
+		wg          sync.WaitGroup
+		mu          sync.Mutex
+		mergedCount int
+	)
+
+	for w := 0; w < 2; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				outputFile := filepath.Join(dir, fmt.Sprintf("%s_merged.mkv", task.baseName))
+				videoPath := filepath.Join(dir, task.videoFile)
+				audioPath := filepath.Join(dir, task.audioFile)
+
+				fmt.Printf("Объединение: %s + %s -> %s\n", task.videoFile, task.audioFile, filepath.Base(outputFile))
+
+				cmd := exec.Command("ffmpeg",
+					"-i", videoPath,
+					"-i", audioPath,
+					"-c", "copy",
+					"-map", "0:v:0",
+					"-map", "1:a:0",
+					"-y",
+					outputFile,
+				)
+
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+
+				if err := cmd.Run(); err != nil {
+					fmt.Printf("Ошибка при объединении %s: %v\n", task.baseName, err)
+					continue
+				}
+
+				mu.Lock()
+				mergedCount++
+				mu.Unlock()
+				fmt.Printf("✓ Успешно: %s\n\n", filepath.Base(outputFile))
+			}
+		}()
+	}
+	wg.Wait()
 
 	if mergedCount == 0 {
 		fmt.Println("Не найдено пар файлов для объединения")
