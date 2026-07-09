@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,8 +12,7 @@ import (
 	"sync"
 )
 
-// naturalLess — сравнение строк в «естественном» порядке:
-// "ep 2" < "ep 10", а не "ep 10" < "ep 2" как при обычной сортировке.
+// ... (функции naturalLess, isDigit, extractNumber остаются без изменений) ...
 func naturalLess(a, b string) bool {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
@@ -21,7 +21,6 @@ func naturalLess(a, b string) bool {
 		bDigit := isDigit(cb)
 
 		if aDigit && bDigit {
-			// извлекаем числа и сравниваем численно
 			numA, endA := extractNumber(a, i)
 			numB, endB := extractNumber(b, j)
 			if numA != numB {
@@ -31,7 +30,6 @@ func naturalLess(a, b string) bool {
 			continue
 		}
 
-		// цифры идут перед не-цифрами (опционально)
 		if aDigit != bDigit {
 			return aDigit
 		}
@@ -58,7 +56,6 @@ func extractNumber(s string, start int) (int, int) {
 
 func main() {
 	dir := "."
-
 	if len(os.Args) > 1 {
 		dir = os.Args[1]
 	} else {
@@ -71,6 +68,13 @@ func main() {
 	}
 
 	fmt.Printf("Рабочая директория: %s\n\n", dir)
+
+	// 1. Сразу создаем выходную папку ОДИН РАЗ, а не в каждом воркере
+	outputDir := filepath.Join(dir, "output")
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		fmt.Printf("Ошибка при создании директории %s: %v\n", outputDir, err)
+		os.Exit(1)
+	}
 
 	files, err := os.ReadDir(dir)
 	if err != nil {
@@ -85,7 +89,6 @@ func main() {
 		if file.IsDir() {
 			continue
 		}
-
 		name := file.Name()
 		ext := strings.ToLower(filepath.Ext(name))
 		baseName := strings.TrimSuffix(name, ext)
@@ -98,7 +101,6 @@ func main() {
 		}
 	}
 
-	// Собираем все baseName, для которых есть И видео, И аудио
 	var matched []string
 	for baseName := range videoFiles {
 		if _, exists := audioFiles[baseName]; exists {
@@ -106,23 +108,25 @@ func main() {
 		}
 	}
 
-	// Сортируем в естественном порядке (1, 2, 3, ..., 10, 11, ...)
 	sort.Slice(matched, func(i, j int) bool {
 		return naturalLess(matched[i], matched[j])
 	})
 
-	tasks := make(chan struct {
+	if len(matched) == 0 {
+		fmt.Println("Не найдено пар файлов для объединения")
+		return
+	}
+
+	// Канал задач
+	type Task struct {
 		baseName  string
 		videoFile string
 		audioFile string
-	}, len(matched))
+	}
+	tasks := make(chan Task, len(matched))
 
 	for _, baseName := range matched {
-		tasks <- struct {
-			baseName  string
-			videoFile string
-			audioFile string
-		}{baseName, videoFiles[baseName], audioFiles[baseName]}
+		tasks <- Task{baseName, videoFiles[baseName], audioFiles[baseName]}
 	}
 	close(tasks)
 
@@ -132,22 +136,20 @@ func main() {
 		mergedCount int
 	)
 
-	for w := 0; w < 2; w++ {
+	// Количество одновременных потоков (воркеров)
+	// Можно вынести в переменную, чтобы легко менять
+	workersCount := 2
+
+	for w := 0; w < workersCount; w++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
 			for task := range tasks {
-				outputDir := filepath.Join(dir, "output")
-				err := os.MkdirAll(outputDir, 0755)
-				if err != nil {
-					fmt.Printf("Ошибка при cоздании директории %s: %v\n", outputDir, err)
-					return
-				}
 				outputFile := filepath.Join(outputDir, fmt.Sprintf("%s.mkv", task.baseName))
 				videoPath := filepath.Join(dir, task.videoFile)
 				audioPath := filepath.Join(dir, task.audioFile)
 
-				fmt.Printf("Объединение: %s + %s -> %s\n", task.videoFile, task.audioFile, filepath.Base(outputFile))
+				fmt.Printf("[Воркер %d] Объединение: %s + %s -> %s\n", workerID, task.videoFile, task.audioFile, filepath.Base(outputFile))
 
 				cmd := exec.Command("ffmpeg",
 					"-i", videoPath,
@@ -159,26 +161,27 @@ func main() {
 					outputFile,
 				)
 
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
+				// ПЕРЕХВАТ ВЫВОДА: чтобы ffmpeg не спамил в консоль и не перемешивал логи
+				var stderr bytes.Buffer
+				cmd.Stderr = &stderr
+				cmd.Stdout = nil // Нам не нужен stdout ffmpeg
 
 				if err := cmd.Run(); err != nil {
-					fmt.Printf("Ошибка при объединении %s: %v\n", task.baseName, err)
-					continue
+					fmt.Printf("[Воркер %d] ❌ Ошибка при объединении %s: %v\n", workerID, task.baseName, err)
+					// Выводим лог ffmpeg только если была ошибка, чтобы понять причину
+					fmt.Printf("FFmpeg log:\n%s\n", stderr.String())
+					continue // <-- ВАЖНО: идем к следующей задаче, а не убиваем воркер!
 				}
 
 				mu.Lock()
 				mergedCount++
 				mu.Unlock()
-				fmt.Printf("✓ Успешно: %s\n\n", filepath.Base(outputFile))
+				fmt.Printf("[Воркер %d] ✅ Успешно: %s\n\n", workerID, filepath.Base(outputFile))
 			}
-		}()
+		}(w)
 	}
+
 	wg.Wait()
 
-	if mergedCount == 0 {
-		fmt.Println("Не найдено пар файлов для объединения")
-	} else {
-		fmt.Printf("\nВсего объединено файлов: %d\n", mergedCount)
-	}
+	fmt.Printf("\nВсего объединено файлов: %d из %d\n", mergedCount, len(matched))
 }
