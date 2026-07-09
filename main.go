@@ -1,18 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
-// ... (функции naturalLess, isDigit, extractNumber остаются без изменений) ...
 func naturalLess(a, b string) bool {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
@@ -54,6 +56,39 @@ func extractNumber(s string, start int) (int, int) {
 	return n, end
 }
 
+func getDuration(filePath string) (float64, error) {
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		filePath,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		return 0, err
+	}
+	return duration, nil
+}
+
+// createProgressBar создает текстовый прогресс-бар
+func createProgressBar(current, total int64, width int) string {
+	if total == 0 {
+		return "[?]"
+	}
+	percent := float64(current) / float64(total)
+	filled := int(percent * float64(width))
+	if filled > width {
+		filled = width
+	}
+
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	return fmt.Sprintf("[%s] %3d%%", bar, int(percent*100))
+}
+
 func main() {
 	dir := "."
 	if len(os.Args) > 1 {
@@ -69,7 +104,6 @@ func main() {
 
 	fmt.Printf("Рабочая директория: %s\n\n", dir)
 
-	// 1. Сразу создаем выходную папку ОДИН РАЗ, а не в каждом воркере
 	outputDir := filepath.Join(dir, "output")
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		fmt.Printf("Ошибка при создании директории %s: %v\n", outputDir, err)
@@ -117,7 +151,6 @@ func main() {
 		return
 	}
 
-	// Канал задач
 	type Task struct {
 		baseName  string
 		videoFile string
@@ -132,13 +165,59 @@ func main() {
 
 	var (
 		wg          sync.WaitGroup
-		mu          sync.Mutex
 		mergedCount int
+		printMu     sync.Mutex // Мьютекс для синхронизации вывода
 	)
 
-	// Количество одновременных потоков (воркеров)
-	// Можно вынести в переменную, чтобы легко менять
+	totalFiles := len(matched)
 	workersCount := 2
+
+	// Хранилище статусов воркеров
+	type WorkerStatus struct {
+		CurrentFile string
+		Progress    int64
+		Total       int64
+		Active      bool
+	}
+	workerStatuses := make([]WorkerStatus, workersCount)
+
+	// Горутина для обновления прогресс-баров
+	stopProgress := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				printMu.Lock()
+				// Очищаем экран (опционально)
+				fmt.Print("\033[H\033[2J")
+
+				// Общий прогресс
+				completed := 0
+				for _, status := range workerStatuses {
+					if !status.Active && status.Total > 0 {
+						completed++
+					}
+				}
+				fmt.Printf("Общий прогресс: %d/%d файлов\n", completed, totalFiles)
+				fmt.Println(strings.Repeat("-", 60))
+
+				// Прогресс каждого воркера
+				for i, status := range workerStatuses {
+					if status.Active {
+						bar := createProgressBar(status.Progress, status.Total, 40)
+						fmt.Printf("Воркер %d: %s %s\n", i+1, bar, status.CurrentFile)
+					} else {
+						fmt.Printf("Воркер %d: Ожидание задачи...\n", i+1)
+					}
+				}
+				printMu.Unlock()
+			case <-stopProgress:
+				return
+			}
+		}
+	}()
 
 	for w := 0; w < workersCount; w++ {
 		wg.Add(1)
@@ -149,7 +228,20 @@ func main() {
 				videoPath := filepath.Join(dir, task.videoFile)
 				audioPath := filepath.Join(dir, task.audioFile)
 
-				fmt.Printf("[Воркер %d] Объединение: %s + %s -> %s\n", workerID, task.videoFile, task.audioFile, filepath.Base(outputFile))
+				duration, err := getDuration(videoPath)
+				if err != nil {
+					duration = 0
+				}
+
+				// Обновляем статус воркера
+				printMu.Lock()
+				workerStatuses[workerID] = WorkerStatus{
+					CurrentFile: task.baseName,
+					Progress:    0,
+					Total:       int64(duration),
+					Active:      true,
+				}
+				printMu.Unlock()
 
 				cmd := exec.Command("ffmpeg",
 					"-i", videoPath,
@@ -157,31 +249,63 @@ func main() {
 					"-c", "copy",
 					"-map", "0:v:0",
 					"-map", "1:a:0",
+					"-progress", "pipe:1",
+					"-nostats",
 					"-y",
 					outputFile,
 				)
 
-				// ПЕРЕХВАТ ВЫВОДА: чтобы ffmpeg не спамил в консоль и не перемешивал логи
-				var stderr bytes.Buffer
-				cmd.Stderr = &stderr
-				cmd.Stdout = nil // Нам не нужен stdout ffmpeg
-
-				if err := cmd.Run(); err != nil {
-					fmt.Printf("[Воркер %d] ❌ Ошибка при объединении %s: %v\n", workerID, task.baseName, err)
-					// Выводим лог ffmpeg только если была ошибка, чтобы понять причину
-					fmt.Printf("FFmpeg log:\n%s\n", stderr.String())
-					continue // <-- ВАЖНО: идем к следующей задаче, а не убиваем воркер!
+				stdout, err := cmd.StdoutPipe()
+				if err != nil {
+					continue
 				}
 
-				mu.Lock()
+				var stderr bytes.Buffer
+				cmd.Stderr = &stderr
+
+				if err := cmd.Start(); err != nil {
+					continue
+				}
+
+				scanner := bufio.NewScanner(stdout)
+				timeRegex := regexp.MustCompile(`out_time_ms=(\d+)`)
+
+				go func() {
+					for scanner.Scan() {
+						line := scanner.Text()
+						if matches := timeRegex.FindStringSubmatch(line); len(matches) > 1 && duration > 0 {
+							timeMs, _ := strconv.ParseInt(matches[1], 10, 64)
+							timeSec := timeMs / 1000000
+
+							printMu.Lock()
+							workerStatuses[workerID].Progress = timeSec
+							printMu.Unlock()
+						}
+					}
+				}()
+
+				if err := cmd.Wait(); err != nil {
+					continue
+				}
+
+				// Завершаем задачу
+				printMu.Lock()
+				workerStatuses[workerID] = WorkerStatus{
+					CurrentFile: task.baseName,
+					Progress:    int64(duration),
+					Total:       int64(duration),
+					Active:      false,
+				}
 				mergedCount++
-				mu.Unlock()
-				fmt.Printf("[Воркер %d] ✅ Успешно: %s\n\n", workerID, filepath.Base(outputFile))
+				printMu.Unlock()
 			}
 		}(w)
 	}
 
 	wg.Wait()
+	close(stopProgress)
 
-	fmt.Printf("\nВсего объединено файлов: %d из %d\n", mergedCount, len(matched))
+	// Финальный вывод
+	fmt.Print("\033[H\033[2J")
+	fmt.Printf("✅ Всего объединено файлов: %d из %d\n", mergedCount, totalFiles)
 }
