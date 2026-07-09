@@ -5,8 +5,55 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 )
+
+// naturalLess — сравнение строк в «естественном» порядке:
+// "ep 2" < "ep 10", а не "ep 10" < "ep 2" как при обычной сортировке.
+func naturalLess(a, b string) bool {
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		ca, cb := a[i], b[j]
+		aDigit := isDigit(ca)
+		bDigit := isDigit(cb)
+
+		if aDigit && bDigit {
+			// извлекаем числа и сравниваем численно
+			numA, endA := extractNumber(a, i)
+			numB, endB := extractNumber(b, j)
+			if numA != numB {
+				return numA < numB
+			}
+			i, j = endA, endB
+			continue
+		}
+
+		// цифры идут перед не-цифрами (опционально)
+		if aDigit != bDigit {
+			return aDigit
+		}
+
+		if ca != cb {
+			return ca < cb
+		}
+		i++
+		j++
+	}
+	return len(a) < len(b)
+}
+
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+func extractNumber(s string, start int) (int, int) {
+	end := start
+	for end < len(s) && isDigit(s[end]) {
+		end++
+	}
+	n, _ := strconv.Atoi(s[start:end])
+	return n, end
+}
 
 func main() {
 	dir := "."
@@ -14,7 +61,6 @@ func main() {
 	if len(os.Args) > 1 {
 		dir = os.Args[1]
 	} else {
-		// Если аргумент не передан - используем директорию exe
 		exePath, err := os.Executable()
 		if err != nil {
 			fmt.Printf("Ошибка получения пути к exe: %v\n", err)
@@ -51,36 +97,50 @@ func main() {
 		}
 	}
 
-	mergedCount := 0
-	for baseName, videoFile := range videoFiles {
-		if audioFile, exists := audioFiles[baseName]; exists {
-			outputFile := filepath.Join(dir, fmt.Sprintf("%s_merged.mkv", baseName))
-			videoPath := filepath.Join(dir, videoFile)
-			audioPath := filepath.Join(dir, audioFile)
-
-			fmt.Printf("Объединение: %s + %s -> %s\n", videoFile, audioFile, filepath.Base(outputFile))
-
-			cmd := exec.Command("ffmpeg",
-				"-i", videoPath,
-				"-i", audioPath,
-				"-c", "copy",
-				"-map", "0:v:0",
-				"-map", "1:a:0",
-				"-y",
-				outputFile,
-			)
-
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-
-			if err := cmd.Run(); err != nil {
-				fmt.Printf("Ошибка при объединении %s: %v\n", baseName, err)
-				continue
-			}
-
-			mergedCount++
-			fmt.Printf("✓ Успешно: %s\n\n", filepath.Base(outputFile))
+	// Собираем все baseName, для которых есть И видео, И аудио
+	var matched []string
+	for baseName := range videoFiles {
+		if _, exists := audioFiles[baseName]; exists {
+			matched = append(matched, baseName)
 		}
+	}
+
+	// Сортируем в естественном порядке (1, 2, 3, ..., 10, 11, ...)
+	sort.Slice(matched, func(i, j int) bool {
+		return naturalLess(matched[i], matched[j])
+	})
+
+	mergedCount := 0
+	for _, baseName := range matched {
+		videoFile := videoFiles[baseName]
+		audioFile := audioFiles[baseName]
+
+		outputFile := filepath.Join(dir, fmt.Sprintf("%s_merged.mkv", baseName))
+		videoPath := filepath.Join(dir, videoFile)
+		audioPath := filepath.Join(dir, audioFile)
+
+		fmt.Printf("Объединение: %s + %s -> %s\n", videoFile, audioFile, filepath.Base(outputFile))
+
+		cmd := exec.Command("ffmpeg",
+			"-i", videoPath,
+			"-i", audioPath,
+			"-c", "copy",
+			"-map", "0:v:0",
+			"-map", "1:a:0",
+			"-y",
+			outputFile,
+		)
+
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("Ошибка при объединении %s: %v\n", baseName, err)
+			continue
+		}
+
+		mergedCount++
+		fmt.Printf("✓ Успешно: %s\n\n", filepath.Base(outputFile))
 	}
 
 	if mergedCount == 0 {
