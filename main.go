@@ -137,7 +137,13 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for task := range tasks {
-				outputFile := filepath.Join(dir, fmt.Sprintf("%s_merged.mkv", task.baseName))
+				outputDir := filepath.Join(dir, "output")
+				err := os.MkdirAll(outputDir, 0755)
+				if err != nil {
+					fmt.Printf("Ошибка при cоздании директории %s: %v\n", outputDir, err)
+					return
+				}
+				outputFile := filepath.Join(outputDir, fmt.Sprintf("%s.mkv", task.baseName))
 				videoPath := filepath.Join(dir, task.videoFile)
 				audioPath := filepath.Join(dir, task.audioFile)
 
