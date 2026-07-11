@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,16 +14,43 @@ import (
 	"sync/atomic"
 )
 
+var extractLogFile *os.File
+var extractLogMu sync.Mutex
+
+func setupExtractLog(dir string) {
+	f, err := os.OpenFile(filepath.Join(dir, "out.log"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return
+	}
+	extractLogFile = f
+}
+
+func elprint(s string) {
+	fmt.Print(s)
+	extractLogMu.Lock()
+	if extractLogFile != nil {
+		extractLogFile.WriteString(s)
+	}
+	extractLogMu.Unlock()
+}
+
+func elprintf(format string, a ...any) {
+	s := fmt.Sprintf(format, a...)
+	elprint(s)
+}
+
 // Структуры для парсинга JSON от mkvmerge
+type MkvTrackProperties struct {
+	Language     string `json:"language"`
+	LanguageIETF string `json:"language_ietf"`
+	CodecID      string `json:"codec_id"`
+}
+
 type MkvTrack struct {
-	ID         int    `json:"id"`
-	Type       string `json:"type"`
-	Codec      string `json:"codec"`
-	Properties struct {
-		Language     string `json:"language"`
-		LanguageIETF string `json:"language_ietf"`
-		CodecID      string `json:"codec_id"`
-	} `json:"properties"`
+	ID         int                `json:"id"`
+	Type       string             `json:"type"`
+	Codec      string             `json:"codec"`
+	Properties MkvTrackProperties `json:"properties"`
 }
 
 type MkvIdentifyOutput struct {
@@ -33,33 +61,37 @@ func main() {
 	// Определяем директорию, где находится исполняемый файл
 	execPath, err := os.Executable()
 	if err != nil {
-		fmt.Printf("Ошибка: %v\n", err)
+		elprintf("Ошибка: %v\n", err)
 		os.Exit(1)
 	}
 	baseDir := filepath.Dir(execPath)
-	fmt.Printf("Рабочая директория: %s\n", baseDir)
+	setupExtractLog(baseDir)
+	if extractLogFile != nil {
+		defer extractLogFile.Close()
+	}
+	elprintf("Рабочая директория: %s\n", baseDir)
 
 	// Проверяем наличие утилит из MKVToolNix
 	if _, err := exec.LookPath("mkvmerge"); err != nil {
-		fmt.Println("Ошибка: mkvmerge не найден в PATH. Установите MKVToolNix.")
+		elprint("Ошибка: mkvmerge не найден в PATH. Установите MKVToolNix.\n")
 		os.Exit(1)
 	}
 	if _, err := exec.LookPath("mkvextract"); err != nil {
-		fmt.Println("Ошибка: mkvextract не найден в PATH. Установите MKVToolNix.")
+		elprint("Ошибка: mkvextract не найден в PATH. Установите MKVToolNix.\n")
 		os.Exit(1)
 	}
 
 	// Создаём папку output
 	outputDir := filepath.Join(baseDir, "output")
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		fmt.Printf("Не удалось создать папку output: %v\n", err)
+		elprintf("Не удалось создать папку output: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Собираем список видеофайлов
 	entries, err := os.ReadDir(baseDir)
 	if err != nil {
-		fmt.Printf("Ошибка чтения директории: %v\n", err)
+		elprintf("Ошибка чтения директории: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -75,7 +107,7 @@ func main() {
 	}
 
 	if len(videoFiles) == 0 {
-		fmt.Println("Видеофайлов не найдено.")
+		elprint("Видеофайлов не найдено.\n")
 		return
 	}
 
@@ -86,7 +118,7 @@ func main() {
 	// Ограничиваем параллельность до 2
 	sem := make(chan struct{}, 2)
 
-	fmt.Printf("Найдено %d файлов. Обработка в 2 потока...\n\n", total)
+	elprintf("Найдено %d файлов. Обработка в 2 потока...\n\n", total)
 
 	for _, fname := range videoFiles {
 		wg.Add(1)
@@ -96,23 +128,23 @@ func main() {
 			defer func() { <-sem }() // освобождаем
 
 			filePath := filepath.Join(baseDir, filename)
-			fmt.Printf("[%d/%d] Начало обработки: %s\n", atomic.LoadInt32(&completed)+1, total, filename)
+			elprintf("[%d/%d] Начало обработки: %s\n", atomic.LoadInt32(&completed)+1, total, filename)
 
 			err := processVideo(filePath, outputDir)
 			if err != nil {
-				fmt.Printf("  ❌ Ошибка в %s: %v\n", filename, err)
+				elprintf("  ❌ Ошибка в %s: %v\n", filename, err)
 			} else {
-				fmt.Printf("  ✅ Завершено: %s\n", filename)
+				elprintf("  ✅ Завершено: %s\n", filename)
 			}
 
 			atomic.AddInt32(&completed, 1)
 			percent := float64(atomic.LoadInt32(&completed)) / float64(total) * 100
-			fmt.Printf("📊 Прогресс: %d/%d (%.1f%%)\n\n", atomic.LoadInt32(&completed), total, percent)
+			elprintf("📊 Прогресс: %d/%d (%.1f%%)\n\n", atomic.LoadInt32(&completed), total, percent)
 		}(fname)
 	}
 
 	wg.Wait()
-	fmt.Println("✅ Все файлы обработаны.")
+	elprint("✅ Все файлы обработаны.\n")
 }
 
 // isVideoFile проверяет расширение видеофайла
@@ -154,6 +186,12 @@ func processVideo(videoPath, outputDir string) error {
 		return fmt.Errorf("не удалось прочитать дорожки: %w", err)
 	}
 
+	elprintf("  Найдено треков: %d\n", len(tracks))
+	for i, t := range tracks {
+		elprintf("    [%d] type=%s id=%d codec=%s lang=%s codec_id=%s\n",
+			i, t.Type, t.ID, t.Codec, t.Properties.Language, t.Properties.CodecID)
+	}
+
 	// Ищем русскую аудиодорожку
 	var rusTrack *MkvTrack
 	for _, track := range tracks {
@@ -185,7 +223,7 @@ func processVideo(videoPath, outputDir string) error {
 		return fmt.Errorf("ошибка извлечения: %w", err)
 	}
 
-	fmt.Printf("  🎵 Извлечена русская аудиодорожка (ID=%d) -> %s\n", rusTrack.ID, outName)
+	elprintf("  🎵 Извлечена русская аудиодорожка (ID=%d) -> %s\n", rusTrack.ID, outName)
 	return nil
 }
 
@@ -197,18 +235,21 @@ func getTracks(videoPath string) ([]MkvTrack, error) {
 		"--identify",
 		videoPath,
 	)
-	output, err := cmd.Output()
-	if err != nil {
-		// Если команда завершилась с ошибкой, выводим stderr для диагностики
-		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("mkvmerge завершился с ошибкой: %s", string(ee.Stderr))
-		}
-		return nil, fmt.Errorf("не удалось выполнить mkvmerge: %w", err)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("mkvmerge ошибка: %v, stderr: %s", err, stderr.String())
 	}
 
 	var data MkvIdentifyOutput
-	if err := json.Unmarshal(output, &data); err != nil {
-		return nil, fmt.Errorf("не удалось разобрать JSON: %w", err)
+	if err := json.Unmarshal(stdout.Bytes(), &data); err != nil {
+		return nil, fmt.Errorf("не удалось разобрать JSON: %w\nraw: %s", err, stdout.String()[:min(200, stdout.Len())])
+	}
+	if len(data.Tracks) == 0 {
+		return nil, fmt.Errorf("дорожки не найдены, raw: %s", stdout.String()[:min(200, stdout.Len())])
 	}
 	return data.Tracks, nil
 }

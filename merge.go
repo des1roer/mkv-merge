@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,14 +15,37 @@ import (
 	"time"
 )
 
-// naturalLess для естественной сортировки
+var logFile *os.File
+var logMu sync.Mutex
+
+func setupLog(dir string) {
+	f, err := os.OpenFile(filepath.Join(dir, "out.log"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return
+	}
+	logFile = f
+}
+
+func lprint(s string) {
+	fmt.Print(s)
+	logMu.Lock()
+	if logFile != nil {
+		logFile.WriteString(s)
+	}
+	logMu.Unlock()
+}
+
+func lprintf(format string, a ...any) {
+	s := fmt.Sprintf(format, a...)
+	lprint(s)
+}
+
 func naturalLess(a, b string) bool {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
 		ca, cb := a[i], b[j]
 		aDigit := isDigit(ca)
 		bDigit := isDigit(cb)
-
 		if aDigit && bDigit {
 			numA, endA := extractNumber(a, i)
 			numB, endB := extractNumber(b, j)
@@ -31,11 +55,9 @@ func naturalLess(a, b string) bool {
 			i, j = endA, endB
 			continue
 		}
-
 		if aDigit != bDigit {
 			return aDigit
 		}
-
 		if ca != cb {
 			return ca < cb
 		}
@@ -56,7 +78,6 @@ func extractNumber(s string, start int) (int, int) {
 	return n, end
 }
 
-// createProgressBar создает текстовый прогресс-бар
 func createProgressBar(percent int, width int) string {
 	if percent > 100 {
 		percent = 100
@@ -69,43 +90,56 @@ func createProgressBar(percent int, width int) string {
 	return fmt.Sprintf("[%s] %3d%%", bar, percent)
 }
 
+func getDuration(filePath string) float64 {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1", filePath)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	dur, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		return 0
+	}
+	return dur
+}
+
 func main() {
-	// Определяем директорию
 	dir := "."
 	if len(os.Args) > 1 {
 		dir = os.Args[1]
 	} else {
 		exePath, err := os.Executable()
 		if err != nil {
-			fmt.Printf("Ошибка получения пути к exe: %v\n", err)
+			lprintf("Ошибка получения пути к exe: %v\n", err)
 			os.Exit(1)
 		}
 		dir = filepath.Dir(exePath)
 	}
 
-	fmt.Printf("Рабочая директория: %s\n\n", dir)
-
-	// Проверяем наличие mkvmerge
-	if _, err := exec.LookPath("mkvmerge"); err != nil {
-		fmt.Println("Ошибка: mkvmerge не найден в PATH. Установите MKVToolNix.")
-		os.Exit(1)
+	setupLog(dir)
+	if logFile != nil {
+		defer logFile.Close()
 	}
+
+	lprintf("Рабочая директория: %s\n\n", dir)
 
 	outputDir := filepath.Join(dir, "output")
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		fmt.Printf("Ошибка при создании директории %s: %v\n", outputDir, err)
+		lprintf("Ошибка при создании директории %s: %v\n", outputDir, err)
 		os.Exit(1)
 	}
 
 	files, err := os.ReadDir(dir)
 	if err != nil {
-		fmt.Printf("Ошибка чтения директории: %v\n", err)
+		lprintf("Ошибка чтения директории: %v\n", err)
 		os.Exit(1)
 	}
 
 	videoFiles := make(map[string]string)
 	audioFiles := make(map[string]string)
-	videoExt := make(map[string]string) // baseName -> video extension
+	videoExt := make(map[string]string)
 
 	videoExts := map[string]bool{
 		".mkv": true, ".mp4": true, ".avi": true, ".mov": true,
@@ -123,7 +157,6 @@ func main() {
 		name := file.Name()
 		ext := strings.ToLower(filepath.Ext(name))
 		baseName := strings.TrimSuffix(name, ext)
-
 		if videoExts[ext] {
 			videoFiles[baseName] = name
 			videoExt[baseName] = ext
@@ -139,13 +172,12 @@ func main() {
 			matched = append(matched, baseName)
 		}
 	}
-
 	sort.Slice(matched, func(i, j int) bool {
 		return naturalLess(matched[i], matched[j])
 	})
 
 	if len(matched) == 0 {
-		fmt.Println("Не найдено пар файлов для объединения")
+		lprint("Не найдено пар файлов для объединения\n")
 		return
 	}
 
@@ -155,11 +187,20 @@ func main() {
 		audioFile string
 	}
 	tasks := make(chan Task, len(matched))
-
 	for _, baseName := range matched {
 		tasks <- Task{baseName, videoFiles[baseName], audioFiles[baseName]}
 	}
 	close(tasks)
+
+	type WorkerStatus struct {
+		CurrentFile string
+		Percent     int
+		Active      bool
+	}
+
+	workersCount := 2
+	workerStatuses := make([]WorkerStatus, workersCount)
+	totalFiles := len(matched)
 
 	var (
 		wg          sync.WaitGroup
@@ -167,17 +208,7 @@ func main() {
 		printMu     sync.Mutex
 	)
 
-	totalFiles := len(matched)
-	workersCount := 2
-
-	type WorkerStatus struct {
-		CurrentFile string
-		Percent     int // 0-100
-		Active      bool
-	}
-	workerStatuses := make([]WorkerStatus, workersCount)
-
-	// Горутина для обновления прогресс-баров
+	// Progress bar — overwrites line with \r
 	stopProgress := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(300 * time.Millisecond)
@@ -186,32 +217,34 @@ func main() {
 			select {
 			case <-ticker.C:
 				printMu.Lock()
-				// Очищаем экран
-				fmt.Print("\033[H\033[2J")
-
+				fmt.Print("\r")
 				completed := 0
 				for _, status := range workerStatuses {
 					if !status.Active && status.Percent >= 100 {
 						completed++
 					}
 				}
-				fmt.Printf("Общий прогресс: %d/%d файлов\n", completed, totalFiles)
-				fmt.Println(strings.Repeat("-", 60))
-
+				s := fmt.Sprintf("%d/%d | ", completed, totalFiles)
 				for i, status := range workerStatuses {
+					if i > 0 {
+						s += " | "
+					}
 					if status.Active {
-						bar := createProgressBar(status.Percent, 40)
-						fmt.Printf("Воркер %d: %s %s\n", i+1, bar, status.CurrentFile)
+						bar := createProgressBar(status.Percent, 25)
+						s += fmt.Sprintf("W%d: %s %s", i+1, bar, status.CurrentFile)
 					} else {
-						fmt.Printf("Воркер %d: Ожидание задачи...\n", i+1)
+						s += fmt.Sprintf("W%d: idle", i+1)
 					}
 				}
+				fmt.Print(s + "\r")
 				printMu.Unlock()
 			case <-stopProgress:
 				return
 			}
 		}
 	}()
+
+	progRe := regexp.MustCompile(`out_time_ms=(\d+)`)
 
 	for w := 0; w < workersCount; w++ {
 		wg.Add(1)
@@ -226,7 +259,8 @@ func main() {
 				videoPath := filepath.Join(dir, task.videoFile)
 				audioPath := filepath.Join(dir, task.audioFile)
 
-				// Обновляем статус воркера
+				totalDur := getDuration(videoPath)
+
 				printMu.Lock()
 				workerStatuses[workerID] = WorkerStatus{
 					CurrentFile: task.baseName,
@@ -235,25 +269,25 @@ func main() {
 				}
 				printMu.Unlock()
 
-				// Команда mkvmerge: берём видео из первого файла (0:0) и аудио из второго (1:0)
-				cmd := exec.Command("mkvmerge",
-					"-o", outputFile,
-					"--video-tracks", "0:0",
-					"--audio-tracks", "1:0",
-					videoPath,
-					audioPath,
+				cmd := exec.Command("ffmpeg",
+					"-y", "-i", videoPath, "-i", audioPath,
+					"-c", "copy",
+					"-map", "0:v", "-map", "0:s", "-map", "1:a",
+					"-map_metadata", "0",
+					"-progress", "pipe:1", "-nostats",
+					outputFile,
 				)
 
-				// Захватываем stderr для прогресса
-				stderr, err := cmd.StderrPipe()
+				stdout, err := cmd.StdoutPipe()
 				if err != nil {
 					printMu.Lock()
 					workerStatuses[workerID].Active = false
 					printMu.Unlock()
 					continue
 				}
+				var stderrOut bytes.Buffer
+				cmd.Stderr = &stderrOut
 
-				// Запускаем
 				if err := cmd.Start(); err != nil {
 					printMu.Lock()
 					workerStatuses[workerID].Active = false
@@ -261,34 +295,40 @@ func main() {
 					continue
 				}
 
-				// Читаем stderr построчно и ищем прогресс
-				scanner := bufio.NewScanner(stderr)
-				progressRegex := regexp.MustCompile(`Progress:\s*(\d+)%`)
-
 				go func() {
+					scanner := bufio.NewScanner(stdout)
 					for scanner.Scan() {
 						line := scanner.Text()
-						if matches := progressRegex.FindStringSubmatch(line); len(matches) > 1 {
-							p, _ := strconv.Atoi(matches[1])
+						if matches := progRe.FindStringSubmatch(line); len(matches) > 1 && totalDur > 0 {
+							timeMs, _ := strconv.ParseInt(matches[1], 10, 64)
+							pct := int(float64(timeMs) / 1e6 / totalDur * 100)
+							if pct > 99 {
+								pct = 99
+							}
 							printMu.Lock()
-							if p > workerStatuses[workerID].Percent {
-								workerStatuses[workerID].Percent = p
+							if pct > workerStatuses[workerID].Percent {
+								workerStatuses[workerID].Percent = pct
 							}
 							printMu.Unlock()
 						}
 					}
 				}()
 
-				// Ждём завершения
 				if err := cmd.Wait(); err != nil {
-					// Ошибка, но всё равно помечаем как завершённое
+					fmt.Printf("\n❌ Ошибка: %s — %v\n", task.baseName, err)
+					if stderrOut.Len() > 0 {
+						lines := strings.Split(strings.TrimSpace(stderrOut.String()), "\n")
+						if lastLine := lines[len(lines)-1]; lastLine != "" {
+							fmt.Printf("   stderr: %s\n", lastLine)
+						}
+					}
 					printMu.Lock()
 					workerStatuses[workerID].Active = false
 					printMu.Unlock()
 					continue
 				}
 
-				// Завершено успешно
+				fmt.Printf("\n✅ Завершено: %s\n", task.baseName)
 				printMu.Lock()
 				workerStatuses[workerID] = WorkerStatus{
 					CurrentFile: task.baseName,
@@ -304,7 +344,5 @@ func main() {
 	wg.Wait()
 	close(stopProgress)
 
-	// Финальный вывод
-	fmt.Print("\033[H\033[2J")
-	fmt.Printf("✅ Всего объединено файлов: %d из %d\n", mergedCount, totalFiles)
+	fmt.Printf("\n✅ Всего объединено файлов: %d из %d\n", mergedCount, totalFiles)
 }
