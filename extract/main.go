@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,7 +56,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Собираем список видеофайлов (только .mkv для надёжности, можно расширить)
+	// Собираем список видеофайлов
 	entries, err := os.ReadDir(baseDir)
 	if err != nil {
 		fmt.Printf("Ошибка чтения директории: %v\n", err)
@@ -73,7 +75,7 @@ func main() {
 	}
 
 	if len(videoFiles) == 0 {
-		fmt.Println("Видеофайлов (с расширением .mkv) не найдено.")
+		fmt.Println("Видеофайлов не найдено.")
 		return
 	}
 
@@ -113,10 +115,35 @@ func main() {
 	fmt.Println("✅ Все файлы обработаны.")
 }
 
-// isVideoFile проверяет расширение (для надёжности берём только .mkv)
+// isVideoFile проверяет расширение видеофайла
 func isVideoFile(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
-	return ext == ".mkv"
+	videoExts := map[string]bool{
+		".mkv": true, ".mp4": true, ".avi": true, ".mov": true,
+		".webm": true, ".m4v": true, ".wmv": true, ".flv": true,
+	}
+	return videoExts[ext]
+}
+
+// parseEpisodeNumber извлекает номер эпизода из имени файла
+func parseEpisodeNumber(filename string) int {
+	base := strings.TrimSuffix(filename, filepath.Ext(filename))
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\bep(?:isode)?[\s_.\-]*(\d+)`),
+		regexp.MustCompile(`(?i)\bS\d+E(\d+)`),
+		regexp.MustCompile(`(?i)\bсерия[\s_.\-]*(\d+)`),
+		regexp.MustCompile(`(?i)\b[\s_.\-]*(\d+)$`),
+	}
+	for _, re := range patterns {
+		match := re.FindStringSubmatch(base)
+		if len(match) > 1 {
+			num, _ := strconv.Atoi(match[1])
+			if num > 0 {
+				return num
+			}
+		}
+	}
+	return 0
 }
 
 // processVideo – извлечение русской аудиодорожки из одного файла
@@ -148,8 +175,9 @@ func processVideo(videoPath, outputDir string) error {
 		ext = ".mka" // на всякий случай
 	}
 
-	base := strings.TrimSuffix(filepath.Base(videoPath), filepath.Ext(videoPath))
-	outName := fmt.Sprintf("%s_russian_audio_%d%s", base, rusTrack.ID, ext)
+	folderName := filepath.Base(filepath.Dir(videoPath))
+	epNum := parseEpisodeNumber(filepath.Base(videoPath))
+	outName := fmt.Sprintf("%s_%02d%s", folderName, epNum, ext)
 	outPath := filepath.Join(outputDir, outName)
 
 	// Извлекаем дорожку

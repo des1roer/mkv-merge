@@ -105,6 +105,16 @@ func main() {
 
 	videoFiles := make(map[string]string)
 	audioFiles := make(map[string]string)
+	videoExt := make(map[string]string) // baseName -> video extension
+
+	videoExts := map[string]bool{
+		".mkv": true, ".mp4": true, ".avi": true, ".mov": true,
+		".webm": true, ".m4v": true, ".wmv": true, ".flv": true,
+	}
+	audioExts := map[string]bool{
+		".mka": true, ".m4a": true, ".aac": true, ".ac3": true,
+		".eac3": true, ".dts": true, ".wav": true, ".mp3": true,
+	}
 
 	for _, file := range files {
 		if file.IsDir() {
@@ -114,10 +124,11 @@ func main() {
 		ext := strings.ToLower(filepath.Ext(name))
 		baseName := strings.TrimSuffix(name, ext)
 
-		switch ext {
-		case ".mkv":
+		if videoExts[ext] {
 			videoFiles[baseName] = name
-		case ".mka":
+			videoExt[baseName] = ext
+		}
+		if audioExts[ext] {
 			audioFiles[baseName] = name
 		}
 	}
@@ -207,7 +218,11 @@ func main() {
 		go func(workerID int) {
 			defer wg.Done()
 			for task := range tasks {
-				outputFile := filepath.Join(outputDir, fmt.Sprintf("%s.mkv", task.baseName))
+				outputExt := videoExt[task.baseName]
+				if outputExt == "" {
+					outputExt = ".mkv"
+				}
+				outputFile := filepath.Join(outputDir, fmt.Sprintf("%s%s", task.baseName, outputExt))
 				videoPath := filepath.Join(dir, task.videoFile)
 				audioPath := filepath.Join(dir, task.audioFile)
 
