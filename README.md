@@ -8,7 +8,7 @@
 something.mkv + something.mka = something_merged.mkv
 
 ```bash
-GOOS=windows GOARCH=amd64 go build -o merge.exe merge.go
+GOOS=windows GOARCH=amd64 go build -o merge.exe ./merge/merge.go
 ```
 
 ```bash
