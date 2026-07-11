@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +14,7 @@ import (
 	"time"
 )
 
+// naturalLess для естественной сортировки
 func naturalLess(a, b string) bool {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
@@ -56,40 +56,21 @@ func extractNumber(s string, start int) (int, int) {
 	return n, end
 }
 
-func getDuration(filePath string) (float64, error) {
-	cmd := exec.Command("ffprobe",
-		"-v", "error",
-		"-show_entries", "format=duration",
-		"-of", "default=noprint_wrappers=1:nokey=1",
-		filePath,
-	)
-	out, err := cmd.Output()
-	if err != nil {
-		return 0, err
-	}
-	duration, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
-	if err != nil {
-		return 0, err
-	}
-	return duration, nil
-}
-
 // createProgressBar создает текстовый прогресс-бар
-func createProgressBar(current, total int64, width int) string {
-	if total == 0 {
-		return "[?]"
+func createProgressBar(percent int, width int) string {
+	if percent > 100 {
+		percent = 100
 	}
-	percent := float64(current) / float64(total)
-	filled := int(percent * float64(width))
+	filled := int(float64(percent) / 100.0 * float64(width))
 	if filled > width {
 		filled = width
 	}
-
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
-	return fmt.Sprintf("[%s] %3d%%", bar, int(percent*100))
+	return fmt.Sprintf("[%s] %3d%%", bar, percent)
 }
 
 func main() {
+	// Определяем директорию
 	dir := "."
 	if len(os.Args) > 1 {
 		dir = os.Args[1]
@@ -103,6 +84,12 @@ func main() {
 	}
 
 	fmt.Printf("Рабочая директория: %s\n\n", dir)
+
+	// Проверяем наличие mkvmerge
+	if _, err := exec.LookPath("mkvmerge"); err != nil {
+		fmt.Println("Ошибка: mkvmerge не найден в PATH. Установите MKVToolNix.")
+		os.Exit(1)
+	}
 
 	outputDir := filepath.Join(dir, "output")
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -166,17 +153,15 @@ func main() {
 	var (
 		wg          sync.WaitGroup
 		mergedCount int
-		printMu     sync.Mutex // Мьютекс для синхронизации вывода
+		printMu     sync.Mutex
 	)
 
 	totalFiles := len(matched)
 	workersCount := 2
 
-	// Хранилище статусов воркеров
 	type WorkerStatus struct {
 		CurrentFile string
-		Progress    int64
-		Total       int64
+		Percent     int // 0-100
 		Active      bool
 	}
 	workerStatuses := make([]WorkerStatus, workersCount)
@@ -184,29 +169,27 @@ func main() {
 	// Горутина для обновления прогресс-баров
 	stopProgress := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
+		ticker := time.NewTicker(300 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				printMu.Lock()
-				// Очищаем экран (опционально)
+				// Очищаем экран
 				fmt.Print("\033[H\033[2J")
 
-				// Общий прогресс
 				completed := 0
 				for _, status := range workerStatuses {
-					if !status.Active && status.Total > 0 {
+					if !status.Active && status.Percent >= 100 {
 						completed++
 					}
 				}
 				fmt.Printf("Общий прогресс: %d/%d файлов\n", completed, totalFiles)
 				fmt.Println(strings.Repeat("-", 60))
 
-				// Прогресс каждого воркера
 				for i, status := range workerStatuses {
 					if status.Active {
-						bar := createProgressBar(status.Progress, status.Total, 40)
+						bar := createProgressBar(status.Percent, 40)
 						fmt.Printf("Воркер %d: %s %s\n", i+1, bar, status.CurrentFile)
 					} else {
 						fmt.Printf("Воркер %d: Ожидание задачи...\n", i+1)
@@ -228,72 +211,73 @@ func main() {
 				videoPath := filepath.Join(dir, task.videoFile)
 				audioPath := filepath.Join(dir, task.audioFile)
 
-				duration, err := getDuration(videoPath)
-				if err != nil {
-					duration = 0
-				}
-
 				// Обновляем статус воркера
 				printMu.Lock()
 				workerStatuses[workerID] = WorkerStatus{
 					CurrentFile: task.baseName,
-					Progress:    0,
-					Total:       int64(duration),
+					Percent:     0,
 					Active:      true,
 				}
 				printMu.Unlock()
 
-				cmd := exec.Command("ffmpeg",
-					"-i", videoPath,
-					"-i", audioPath,
-					"-c", "copy",
-					"-map", "0:v:0",
-					"-map", "1:a:0",
-					"-progress", "pipe:1",
-					"-nostats",
-					"-y",
-					outputFile,
+				// Команда mkvmerge: берём видео из первого файла (0:0) и аудио из второго (1:0)
+				cmd := exec.Command("mkvmerge",
+					"-o", outputFile,
+					"--video-tracks", "0:0",
+					"--audio-tracks", "1:0",
+					videoPath,
+					audioPath,
 				)
 
-				stdout, err := cmd.StdoutPipe()
+				// Захватываем stderr для прогресса
+				stderr, err := cmd.StderrPipe()
 				if err != nil {
+					printMu.Lock()
+					workerStatuses[workerID].Active = false
+					printMu.Unlock()
 					continue
 				}
 
-				var stderr bytes.Buffer
-				cmd.Stderr = &stderr
-
+				// Запускаем
 				if err := cmd.Start(); err != nil {
+					printMu.Lock()
+					workerStatuses[workerID].Active = false
+					printMu.Unlock()
 					continue
 				}
 
-				scanner := bufio.NewScanner(stdout)
-				timeRegex := regexp.MustCompile(`out_time_ms=(\d+)`)
+				// Читаем stderr построчно и ищем прогресс
+				scanner := bufio.NewScanner(stderr)
+				progressRegex := regexp.MustCompile(`Progress:\s*(\d+)%`)
 
 				go func() {
 					for scanner.Scan() {
 						line := scanner.Text()
-						if matches := timeRegex.FindStringSubmatch(line); len(matches) > 1 && duration > 0 {
-							timeMs, _ := strconv.ParseInt(matches[1], 10, 64)
-							timeSec := timeMs / 1000000
-
+						if matches := progressRegex.FindStringSubmatch(line); len(matches) > 1 {
+							p, _ := strconv.Atoi(matches[1])
 							printMu.Lock()
-							workerStatuses[workerID].Progress = timeSec
+							if p > workerStatuses[workerID].Percent {
+								workerStatuses[workerID].Percent = p
+							}
 							printMu.Unlock()
 						}
 					}
 				}()
 
+				// Ждём завершения
 				if err := cmd.Wait(); err != nil {
+					// Ошибка, но всё равно помечаем как завершённое
+					printMu.Lock()
+					workerStatuses[workerID].Active = false
+					printMu.Unlock()
 					continue
 				}
 
-				// Завершаем задачу
+				// Завершено успешно
 				printMu.Lock()
 				workerStatuses[workerID] = WorkerStatus{
 					CurrentFile: task.baseName,
-					Progress:    int64(duration),
-					Total:       int64(duration),
+					Percent:     100,
 					Active:      false,
 				}
 				mergedCount++
